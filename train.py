@@ -8,6 +8,8 @@ import test  # import test.py to get mAP after each epoch
 from models import *
 from utils.datasets import *
 from utils.utils import *
+import horovod.torch as hvd
+
 
 mixed_precision = True
 try:  # Mixed precision training https://github.com/NVIDIA/apex
@@ -60,6 +62,15 @@ def train():
         hyp['cls_pw'] = 1.
         hyp['obj_pw'] = 1.
 
+    # Horovod: initialize library.
+    hvd.init()    
+    
+    # Horovod: limit # of CPU threads to be used per worker.
+    torch.set_num_threads(1)
+    
+    # Horovod: Pin GPU to be used to process local rank (one GPU per process)
+    torch.cuda.set_device(hvd.local_rank())    
+        
     # Initialize
     init_seeds()
     multi_scale = opt.multi_scale
@@ -90,14 +101,22 @@ def train():
         else:
             pg0 += [v]  # parameter group 0
 
+    # Horovod: scale learning rate by the number of GPUs.
     if opt.adam:
-        optimizer = optim.Adam(pg0, lr=hyp['lr0'])
+        optimizer = optim.Adam(pg0, lr=hyp['lr0']* hvd.size())
         # optimizer = AdaBound(pg0, lr=hyp['lr0'], final_lr=0.1)
     else:
-        optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
+        optimizer = optim.SGD(pg0, lr=hyp['lr0']* hvd.size(), momentum=hyp['momentum'], nesterov=True)
     optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
     del pg0, pg1
 
+    # Horovod: Add Horovod Distributed Optimizer
+    optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters())
+
+    # Horovod: Broadcast parameters from rank 0 to all other processes.
+    hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+    hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+    
     cutoff = -1  # backbone reaches to cutoff layer
     start_epoch = 0
     best_fitness = float('inf')
@@ -173,7 +192,7 @@ def train():
     # Mixed precision training https://github.com/NVIDIA/apex
     if mixed_precision:
         model, optimizer = amp.initialize(model, optimizer, opt_level='O1', verbosity=0)
-
+   
     # Initialize distributed training
     if torch.cuda.device_count() > 1:
         dist.init_process_group(backend='nccl',  # 'distributed backend'
@@ -194,12 +213,17 @@ def train():
                                   cache_labels=True if epochs > 10 else False,
                                   cache_images=False if opt.prebias else opt.cache_images)
 
+    # Horovod: use DistributedSampler to partition data among workers. Manually specify
+    # `num_replicas=hvd.size()` and `rank=hvd.rank()`.
+    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset, num_replicas=hvd.size(), rank=hvd.rank())                              
+                                  
     # Dataloader
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=batch_size,
                                              num_workers=min([os.cpu_count(), batch_size, 16]),
-                                             shuffle=not opt.rect,  # Shuffle=True unless rectangular training is used
+                                             shuffle=False, #not opt.rect,  # Shuffle=True unless rectangular training is used
                                              pin_memory=True,
+                                             sampler=train_sampler, #Horovod: sampler can not use with shuffle
                                              collate_fn=dataset.collate_fn)
 
     # Start training
@@ -335,7 +359,8 @@ def train():
 
         # Save training results
         save = (not opt.nosave) or (final_epoch and not opt.evolve) or opt.prebias
-        if save:
+        # Horovod: save only on first rank.
+        if save and hvd.rank() == 0:
             with open(results_file, 'r') as f:
                 # Create checkpoint
                 chkpt = {'epoch': epoch,
