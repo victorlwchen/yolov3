@@ -6,10 +6,12 @@ from torch.utils.data import DataLoader
 from models import *
 from utils.datasets import *
 from utils.utils import *
+from utils.distributed import *
 
 
 def test(cfg,
          data,
+         hvd,
          weights=None,
          batch_size=16,
          img_size=416,
@@ -46,11 +48,16 @@ def test(cfg,
     names = load_classes(data['names'])  # class names
 
     # Dataloader
-    dataset = LoadImagesAndLabels(test_path, img_size, batch_size)
+    dataset = LoadImagesAndLabels(test_path, img_size, batch_size)#,rect=False)
+    # Horovod: use DistributedSampler to partition data among workers. Manually specify
+    # `num_replicas=hvd.size()` and `rank=hvd.rank()`.
+    test_sampler = DistributedSampler(dataset, batch_size, num_replicas=hvd.size(), rank=hvd.rank())   
+    
     dataloader = DataLoader(dataset,
                             batch_size=batch_size,
-                            num_workers=min([os.cpu_count(), batch_size, 16]),
+                            num_workers=1, #Horovod: multi-worker will fail =min([os.cpu_count(), batch_size, 16]),
                             pin_memory=True,
+                            sampler=test_sampler, #Horovod:
                             collate_fn=dataset.collate_fn)
 
     seen = 0

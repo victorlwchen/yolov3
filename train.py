@@ -8,6 +8,7 @@ import test  # import test.py to get mAP after each epoch
 from models import *
 from utils.datasets import *
 from utils.utils import *
+import os
 import horovod.torch as hvd
 
 
@@ -66,10 +67,11 @@ def train():
     hvd.init()    
     
     # Horovod: limit # of CPU threads to be used per worker.
-    torch.set_num_threads(1)
-    
+    torch.set_num_threads(4)
+
     # Horovod: Pin GPU to be used to process local rank (one GPU per process)
-    torch.cuda.set_device(hvd.local_rank())    
+    torch.cuda.set_device(hvd.local_rank())
+    device = torch.device('cuda:{}'.format(hvd.local_rank()))
         
     # Initialize
     init_seeds()
@@ -84,12 +86,16 @@ def train():
     # Configure run
     data_dict = parse_data_cfg(data)
     train_path = data_dict['train']
+    #train_path = data_dict['valid']
+    
     nc = int(data_dict['classes'])  # number of classes
 
     # Remove previous results
-    for f in glob.glob('*_batch*.jpg') + glob.glob(results_file):
-        os.remove(f)
-
+    # Horovod: other node could fail on delete file
+    if hvd.local_rank() == 0:
+        for f in glob.glob('*_batch*.jpg') + glob.glob(results_file):    
+            os.remove(f)
+        
     # Initialize model
     model = Darknet(cfg, arc=opt.arc).to(device)
 
@@ -194,6 +200,8 @@ def train():
         model, optimizer = amp.initialize(model, optimizer, opt_level='O1', verbosity=0)
    
     # Initialize distributed training
+    # Horovod: Mark these due to conflic with Horovod
+    '''
     if torch.cuda.device_count() > 1:
         dist.init_process_group(backend='nccl',  # 'distributed backend'
                                 init_method='tcp://127.0.0.1:9999',  # distributed training init method
@@ -201,7 +209,7 @@ def train():
                                 rank=0)  # distributed training node rank
         model = torch.nn.parallel.DistributedDataParallel(model)
         model.yolo_layers = model.module.yolo_layers  # move yolo layer indices to top level
-
+    '''
     # Dataset
     dataset = LoadImagesAndLabels(train_path,
                                   img_size,
@@ -220,7 +228,7 @@ def train():
     # Dataloader
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=batch_size,
-                                             num_workers=min([os.cpu_count(), batch_size, 16]),
+                                             num_workers=1, #Horovod: multi-worker will fail =min([os.cpu_count(), batch_size, 16]),
                                              shuffle=False, #not opt.rect,  # Shuffle=True unless rectangular training is used
                                              pin_memory=True,
                                              sampler=train_sampler, #Horovod: sampler can not use with shuffle
@@ -255,6 +263,9 @@ def train():
             dataset.indices = random.choices(range(dataset.n), weights=image_weights, k=dataset.n)  # rand weighted idx
 
         mloss = torch.zeros(4).to(device)  # mean losses
+        # Horovod: set epoch to sampler for shuffling.
+        train_sampler.set_epoch(epoch)
+        
         pbar = tqdm(enumerate(dataloader), total=nb)  # progress bar
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
@@ -271,7 +282,8 @@ def train():
                     imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
             # Plot images with bounding boxes
-            if ni == 0:
+            # Horovod: only root can do it
+            if ni == 0 and hvd.rank() == 0:
                 fname = 'train_batch%g.jpg' % i
                 plot_images(imgs=imgs, targets=targets, paths=paths, fname=fname)
                 if tb_writer:
@@ -298,7 +310,8 @@ def train():
                 return results
 
             # Scale loss by nominal batch_size of 64
-            loss *= batch_size / 64
+            #Horovod : accumulate is not working with Horovod
+            #loss *= batch_size / 64
 
             # Compute gradient
             if mixed_precision:
@@ -308,9 +321,10 @@ def train():
                 loss.backward()
 
             # Accumulate gradient for x batches before optimizing
-            if ni % accumulate == 0:
-                optimizer.step()
-                optimizer.zero_grad()
+            #if ni % accumulate == 0:
+            #Horovod : backward() times should match with step() 
+            optimizer.step()
+            optimizer.zero_grad()
 
             # Print batch results
             mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
@@ -334,10 +348,11 @@ def train():
                 with torch.no_grad():
                     results, maps = test.test(cfg,
                                               data,
+                                              hvd,
                                               batch_size=batch_size,
                                               img_size=opt.img_size,
                                               model=model,
-                                              conf_thres=0.001 if final_epoch and epoch > 0 else 0.1,  # 0.1 for speed
+                                              conf_thres=0.001 if final_epoch and epoch > 0 else 0.1,  # 0.1 for speed                                              
                                               save_json=final_epoch and epoch > 0 and 'coco.data' in data)
 
         # Write epoch results
@@ -417,7 +432,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=273)  # 500200 batches at bs 16, 117263 images = 273 epochs
     parser.add_argument('--batch-size', type=int, default=32)  # effective bs = batch_size * accumulate = 16 * 4 = 64
-    parser.add_argument('--accumulate', type=int, default=2, help='batches to accumulate before optimizing')
+    parser.add_argument('--accumulate', type=int, default=1, help='batches to accumulate before optimizing')
     parser.add_argument('--cfg', type=str, default='cfg/yolov3-spp.cfg', help='cfg file path')
     parser.add_argument('--data', type=str, default='data/coco.data', help='*.data file path')
     parser.add_argument('--multi-scale', action='store_true', help='adjust (67% - 150%) img_size every 10 batches')
@@ -441,7 +456,8 @@ if __name__ == '__main__':
     opt = parser.parse_args()
     opt.weights = last if opt.resume else opt.weights
     print(opt)
-    device = torch_utils.select_device(opt.device, apex=mixed_precision)
+    # Horovod: Specify gpu at other point
+    #device = torch_utils.select_device(opt.device, apex=mixed_precision)
 
     tb_writer = None
     if not opt.evolve:  # Train normally
