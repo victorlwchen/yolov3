@@ -12,7 +12,7 @@ import os
 import horovod.torch as hvd
 
 
-mixed_precision = True
+mixed_precision = False
 try:  # Mixed precision training https://github.com/NVIDIA/apex
     from apex import amp
 except:
@@ -67,7 +67,7 @@ def train():
     hvd.init()    
     
     # Horovod: limit # of CPU threads to be used per worker.
-    torch.set_num_threads(4)
+    torch.set_num_threads(6)
 
     # Horovod: Pin GPU to be used to process local rank (one GPU per process)
     torch.cuda.set_device(hvd.local_rank())
@@ -115,48 +115,44 @@ def train():
         optimizer = optim.SGD(pg0, lr=hyp['lr0']* hvd.size(), momentum=hyp['momentum'], nesterov=True)
     optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
     del pg0, pg1
-
     # Horovod: Add Horovod Distributed Optimizer
-    optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters())
-
-    # Horovod: Broadcast parameters from rank 0 to all other processes.
-    hvd.broadcast_parameters(model.state_dict(), root_rank=0)
-    hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+    optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters(),backward_passes_per_step=accumulate)
     
     cutoff = -1  # backbone reaches to cutoff layer
     start_epoch = 0
     best_fitness = float('inf')
-    attempt_download(weights)
-    if weights.endswith('.pt'):  # pytorch format
-        # possible weights are 'last.pt', 'yolov3-spp.pt', 'yolov3-tiny.pt' etc.
-        if opt.bucket:
-            os.system('gsutil cp gs://%s/last.pt %s' % (opt.bucket, last))  # download from bucket
-        chkpt = torch.load(weights, map_location=device)
+    if hvd.rank() == 0:
+        attempt_download(weights)
+        if weights.endswith('.pt'):  # pytorch format
+            # possible weights are 'last.pt', 'yolov3-spp.pt', 'yolov3-tiny.pt' etc.
+            if opt.bucket:
+                os.system('gsutil cp gs://%s/last.pt %s' % (opt.bucket, last))  # download from bucket
+            chkpt = torch.load(weights, map_location=device)
 
-        # load model
-        # if opt.transfer:
-        chkpt['model'] = {k: v for k, v in chkpt['model'].items() if model.state_dict()[k].numel() == v.numel()}
-        model.load_state_dict(chkpt['model'], strict=False)
-        # else:
-        #    model.load_state_dict(chkpt['model'])
+            # load model
+            # if opt.transfer:
+            chkpt['model'] = {k: v for k, v in chkpt['model'].items() if model.state_dict()[k].numel() == v.numel()}
+            model.load_state_dict(chkpt['model'], strict=False)
+            # else:
+            #    model.load_state_dict(chkpt['model'])
 
-        # load optimizer
-        if chkpt['optimizer'] is not None:
-            optimizer.load_state_dict(chkpt['optimizer'])
-            best_fitness = chkpt['best_fitness']
+            # load optimizer
+            if chkpt['optimizer'] is not None:
+                optimizer.load_state_dict(chkpt['optimizer'])
+                best_fitness = chkpt['best_fitness']
 
-        # load results
-        if chkpt.get('training_results') is not None:
-            with open(results_file, 'w') as file:
-                file.write(chkpt['training_results'])  # write results.txt
+            # load results
+            if chkpt.get('training_results') is not None:
+                with open(results_file, 'w') as file:
+                    file.write(chkpt['training_results'])  # write results.txt
 
-        start_epoch = chkpt['epoch'] + 1
-        del chkpt
+            start_epoch = chkpt['epoch'] + 1
+            del chkpt
 
-    elif len(weights) > 0:  # darknet format
-        # possible weights are 'yolov3.weights', 'yolov3-tiny.conv.15',  'darknet53.conv.74' etc.
-        cutoff = load_darknet_weights(model, weights)
-
+        elif len(weights) > 0:  # darknet format
+            # possible weights are 'yolov3.weights', 'yolov3-tiny.conv.15',  'darknet53.conv.74' etc.
+            cutoff = load_darknet_weights(model, weights)
+   
     if opt.transfer or opt.prebias:  # transfer learning edge (yolo) layers
         nf = int(model.module_defs[model.yolo_layers[0] - 1]['filters'])  # yolo layer size (i.e. 255)
 
@@ -184,6 +180,11 @@ def train():
     scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[round(opt.epochs * x) for x in [0.8, 0.9]], gamma=0.1)
     scheduler.last_epoch = start_epoch - 1
 
+    # Horovod: Broadcast parameters from rank 0 to all other processes.
+    hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+    hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+    start_epoch = hvd.broadcast(torch.tensor(start_epoch), root_rank=0,name='start_epoch').item()    
+    
     # # Plot lr schedule
     # y = []
     # for _ in range(epochs):
@@ -209,7 +210,7 @@ def train():
                                 rank=0)  # distributed training node rank
         model = torch.nn.parallel.DistributedDataParallel(model)
         model.yolo_layers = model.module.yolo_layers  # move yolo layer indices to top level
-    '''
+    ''' 
     # Dataset
     dataset = LoadImagesAndLabels(train_path,
                                   img_size,
@@ -223,8 +224,7 @@ def train():
 
     # Horovod: use DistributedSampler to partition data among workers. Manually specify
     # `num_replicas=hvd.size()` and `rank=hvd.rank()`.
-    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset, num_replicas=hvd.size(), rank=hvd.rank())                              
-                                  
+    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset, num_replicas=hvd.size(), rank=hvd.rank())                                                            
     # Dataloader
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=batch_size,
@@ -265,8 +265,10 @@ def train():
         mloss = torch.zeros(4).to(device)  # mean losses
         # Horovod: set epoch to sampler for shuffling.
         train_sampler.set_epoch(epoch)
-        
-        pbar = tqdm(enumerate(dataloader), total=nb)  # progress bar
+        if hvd.rank() == 0:
+            pbar = tqdm(enumerate(dataloader), total=nb)  # progress bar
+        else:
+            pbar = enumerate(dataloader)
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device)
@@ -310,8 +312,7 @@ def train():
                 return results
 
             # Scale loss by nominal batch_size of 64
-            #Horovod : accumulate is not working with Horovod
-            #loss *= batch_size / 64
+            loss *= batch_size / 64
 
             # Compute gradient
             if mixed_precision:
@@ -321,17 +322,17 @@ def train():
                 loss.backward()
 
             # Accumulate gradient for x batches before optimizing
-            #if ni % accumulate == 0:
-            #Horovod : backward() times should match with step() 
-            optimizer.step()
-            optimizer.zero_grad()
+            if ni % accumulate == 0:
+                optimizer.step()
+                optimizer.zero_grad()
 
             # Print batch results
-            mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
-            mem = torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0  # (GB)
-            s = ('%10s' * 2 + '%10.3g' * 6) % (
-                '%g/%g' % (epoch, epochs - 1), '%.3gG' % mem, *mloss, len(targets), img_size)
-            pbar.set_description(s)
+            if hvd.rank() == 0:
+                mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+                mem = torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0  # (GB)
+                s = ('%10s' * 2 + '%10.3g' * 6) % (
+                    '%g/%g' % (epoch, epochs - 1), '%.3gG' % mem, *mloss, len(targets), img_size)
+                pbar.set_description(s)
 
             # end batch ------------------------------------------------------------------------------------------------
 
@@ -348,7 +349,8 @@ def train():
                 with torch.no_grad():
                     results, maps = test.test(cfg,
                                               data,
-                                              hvd,
+                                              hvd=hvd,
+                                              dist_test=opt.disttest,
                                               batch_size=batch_size,
                                               img_size=opt.img_size,
                                               model=model,
@@ -356,8 +358,9 @@ def train():
                                               save_json=final_epoch and epoch > 0 and 'coco.data' in data)
 
         # Write epoch results
-        with open(results_file, 'a') as f:
-            f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
+        if hvd.rank() == 0:
+            with open(results_file, 'a') as f:
+                f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
 
         # Write Tensorboard results
         if tb_writer:
@@ -404,7 +407,7 @@ def train():
         # end epoch ----------------------------------------------------------------------------------------------------
 
     # end training
-    if len(opt.name):
+    if len(opt.name) and hvd.rank() == 0:
         os.rename('results.txt', 'results_%s.txt' % opt.name)
         os.rename(wdir + 'best.pt', wdir + 'best_%s.pt' % opt.name)
     plot_results()  # save as results.png
@@ -432,7 +435,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=273)  # 500200 batches at bs 16, 117263 images = 273 epochs
     parser.add_argument('--batch-size', type=int, default=32)  # effective bs = batch_size * accumulate = 16 * 4 = 64
-    parser.add_argument('--accumulate', type=int, default=1, help='batches to accumulate before optimizing')
+    parser.add_argument('--accumulate', type=int, default=2, help='batches to accumulate before optimizing')
     parser.add_argument('--cfg', type=str, default='cfg/yolov3-spp.cfg', help='cfg file path')
     parser.add_argument('--data', type=str, default='data/coco.data', help='*.data file path')
     parser.add_argument('--multi-scale', action='store_true', help='adjust (67% - 150%) img_size every 10 batches')
@@ -442,6 +445,8 @@ if __name__ == '__main__':
     parser.add_argument('--transfer', action='store_true', help='transfer learning')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
     parser.add_argument('--notest', action='store_true', help='only test final epoch')
+    #Horovod: Test dataset dist block size = (batch_size * rank size) so it could dispatch to each rank with the same count.
+    parser.add_argument('--disttest', action='store_true', help='Distributed for test dataset. The test set should > (batch-size * rank size)')
     parser.add_argument('--evolve', action='store_true', help='evolve hyperparameters')
     parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
     parser.add_argument('--img-weights', action='store_true', help='select training images by weight')

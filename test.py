@@ -11,7 +11,8 @@ from utils.distributed import *
 
 def test(cfg,
          data,
-         hvd,
+         hvd=None,
+         dist_test=False,
          weights=None,
          batch_size=16,
          img_size=416,
@@ -51,8 +52,10 @@ def test(cfg,
     dataset = LoadImagesAndLabels(test_path, img_size, batch_size)#,rect=False)
     # Horovod: use DistributedSampler to partition data among workers. Manually specify
     # `num_replicas=hvd.size()` and `rank=hvd.rank()`.
-    test_sampler = DistributedSampler(dataset, batch_size, num_replicas=hvd.size(), rank=hvd.rank())   
-    
+    if hvd is not None and dist_test == True:
+        test_sampler = DistributedSampler(dataset, batch_size, num_replicas=hvd.size(), rank=hvd.rank())   
+    else:
+        test_sampler = None
     dataloader = DataLoader(dataset,
                             batch_size=batch_size,
                             num_workers=1, #Horovod: multi-worker will fail =min([os.cpu_count(), batch_size, 16]),
@@ -67,7 +70,11 @@ def test(cfg,
     p, r, f1, mp, mr, map, mf1 = 0., 0., 0., 0., 0., 0., 0.
     loss = torch.zeros(3)
     jdict, stats, ap, ap_class = [], [], [], []
-    for batch_i, (imgs, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
+    if (hvd is not None and hvd.rank() == 0) or hvd is None:
+        pbar = enumerate(tqdm(dataloader, desc=s))
+    else:
+        pbar = enumerate(dataloader)        
+    for batch_i, (imgs, targets, paths, shapes) in pbar:
         targets = targets.to(device)
         imgs = imgs.to(device)
         _, _, height, width = imgs.shape  # batch size, channels, height, width
@@ -219,6 +226,8 @@ if __name__ == '__main__':
     with torch.no_grad():
         test(opt.cfg,
              opt.data,
+             None,
+             False,
              opt.weights,
              opt.batch_size,
              opt.img_size,
