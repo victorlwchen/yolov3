@@ -463,6 +463,8 @@ if __name__ == '__main__':
     print(opt)
     # Horovod: Specify gpu at other point
     #device = torch_utils.select_device(opt.device, apex=mixed_precision)
+    # scale hyp['obj'] by img_size (evolved at 320)
+    hyp['obj'] *= opt.img_size / 320.
 
     tb_writer = None
     if not opt.evolve:  # Train normally
